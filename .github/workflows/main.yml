@@ -1,4 +1,4 @@
-name: VORQEN Munch | BakaSU + SUSFS 2.4.0 + NoMount 2.3.0
+name: VORQEN Munch | BakaSU + SUSFS 2.4.0 + NoMount 2.3.1
 # Nama yang tampil di tab Actions dan daftar workflow (hanya label, tidak mempengaruhi build).
 # run-name = judul tiap run, memuat commit BakaSU yang dipakai saat Run workflow.
 run-name: VORQEN Munch - BakaSU ${{ inputs.ksu_ref || 'cac1e793' }}
@@ -20,7 +20,8 @@ run-name: VORQEN Munch - BakaSU ${{ inputs.ksu_ref || 'cac1e793' }}
 #     kernel tanpa anchor susfs (patch Jack 4.19 ini termasuk), diverifikasi di step "Diagnosis SELinux/DirtySepolicy"
 #   Rilis ini butuh manager BakaSU v4.2.0-rc3: pakai APK dari rilis yang sama (cek versionCode via input ksu_version_code).
 #   Kode versi driver (KSU_VERSION) disamakan dengan versionCode manager lewat ksu_sync_version (default aktif).
-# NoMount: v2.3.0-720 (maxsteeel), built-in. Pasang juga metamodule NoMount v2.3.0 lewat manager setelah flash.
+# NoMount: v2.3.1 (maxsteeel), built-in (protokol wire v23, sama dengan v2.3.0 -> driver & modul v2.3.0/v2.3.1 saling
+#   kompatibel, tapi disarankan update bersamaan). Pasang juga metamodule NoMount v2.3.1 lewat manager setelah flash.
 # SUSFS bersifat opsional lewat input susfs_enable. 10 opsi SUSFS (SUS_PATH, SUS_MOUNT, SUS_KSTAT, SPOOF_UNAME, ENABLE_LOG,
 #   HIDE_KSU_SUSFS_SYMBOLS, SPOOF_CMDLINE_OR_BOOTCONFIG, OPEN_REDIRECT, SUS_MAP, PRIORITY_UID_FILTER) sama dengan build whyred;
 #   opsi ke-10 (filter uid prioritas, CMD 0x60030) native di patch Jack >= 38bbbd5, matikan lewat input susfs_priority_uid_filter.
@@ -90,7 +91,7 @@ env:
   KBUILD_BUILD_USER: ${{ inputs.build_user || 'kurosakiJin' }}
   KBUILD_BUILD_HOST: ${{ inputs.build_host || 'bankai' }}
   TZ: Asia/Jakarta
-  NOMOUNT_VERSION: v2.3.0-720
+  NOMOUNT_VERSION: v2.3.1
   KERNEL_REPO: https://github.com/liyafe1997/kernel_xiaomi_sm8250_mod
   KERNEL_BRANCH: android15-lineage22-mod
   DEVICE: munch
@@ -298,6 +299,150 @@ jobs:
             exit 1
           fi
           echo "::notice::SUSFS lama dibuang"
+
+      - name: Buang hook KernelSU lama bawaan tree (total, sadar #ifdef)
+        working-directory: kernel_source
+        run: |
+          set -eo pipefail
+          # Tree liyafe1997 membawa hook KernelSU gaya lama (blok #ifdef CONFIG_KSU ... #endif) di fs/exec.c, fs/open.c,
+          # fs/read_write.c, fs/stat.c, drivers/input/input.c, dll. Skrip hook Jack MELEWATI file yang sudah memuat
+          # "ksu_handle", dan BakaSU menolak nama hook lama (ksu_vfs_read_hook, ksu_input_hook, ksu_execveat_hook).
+          # Menghapus baris satu per satu dengan sed MERUSAK kode (extern multi-baris menggantung, "else" yatim setelah
+          # "if (ksu_execveat_hook)" dihapus). Skrip di bawah membuang blok preprosesor KSU utuh dan mempertahankan cabang #else.
+          # Dijalankan SEBELUM patch SUSFS supaya guard CONFIG_KSU_SUSFS_* milik SUSFS tidak ikut tersentuh (juga dikecualikan di skrip).
+          echo "== Berkas tree yang menyebut KSU (SEBELUM) =="
+          git grep -nE 'CONFIG_KSU|ksu_' -- '*.c' '*.h' | cut -c1-160 || echo "(tidak ada)"
+          cat > /tmp/strip_ksu.py <<'PYSTRIP'
+          #!/usr/bin/env python3
+          # Buang hook KernelSU lama bawaan tree dari berkas C/H yang DILACAK git.
+          # Semua blok #if/#ifdef/#ifndef/#elif yang kondisinya hanya bergantung pada CONFIG_KSU* dievaluasi dengan
+          # CONFIG_KSU* = TIDAK DIDEFINISIKAN; cabang yang mati dibuang, cabang hidup dipertahankan, baris direktifnya dihapus.
+          # Kondisi campuran (KSU + simbol lain) disederhanakan secara tri-state bila memungkinkan, selain itu dibiarkan
+          # dan dilaporkan oleh pemeriksaan akhir.
+          import re, subprocess, sys
+
+          KSU = re.compile(r'\bCONFIG_KSU(?!_SUSFS)\w*')
+
+          class Tri:
+              def __init__(s, v): s.v = v
+              def __and__(a, b):
+                  if a.v is False or b.v is False: return Tri(False)
+                  if a.v is True and b.v is True: return Tri(True)
+                  return Tri(None)
+              def __or__(a, b):
+                  if a.v is True or b.v is True: return Tri(True)
+                  if a.v is False and b.v is False: return Tri(False)
+                  return Tri(None)
+              def __invert__(a): return Tri(None if a.v is None else (not a.v))
+
+          def strip_comments(c):
+              c = re.sub(r'/\*.*?\*/', ' ', c)
+              return re.sub(r'//.*$', ' ', c).strip()
+
+          def evaluate(kind, cond):
+              cond = strip_comments(cond)
+              if kind in ('ifdef', 'ifndef'):
+                  name = cond.split()[0] if cond.split() else ''
+                  if not KSU.fullmatch(name): return None
+                  return kind == 'ifndef'
+              if not KSU.search(cond): return None
+              if re.search(r'==|!=|<=|>=|<|>|\+|-|\*|/|%|\?|:', cond): return None
+              e = re.sub(r'IS_(?:ENABLED|BUILTIN|MODULE|REACHABLE)\s*\(\s*CONFIG_KSU\w*\s*\)', ' \x01 ', cond)
+              e = re.sub(r'defined\s*\(\s*(\w+)\s*\)', lambda m: ' \x01 ' if KSU.fullmatch(m.group(1)) else ' \x02 ', e)
+              e = re.sub(r'defined\s+(\w+)', lambda m: ' \x01 ' if KSU.fullmatch(m.group(1)) else ' \x02 ', e)
+              e = KSU.sub(' \x01 ', e)
+              e = re.sub(r'\b[A-Za-z_]\w*\b', ' \x02 ', e)
+              e = re.sub(r'\b0\b', ' \x01 ', e)
+              e = re.sub(r'\b[1-9]\d*\b', ' \x03 ', e)
+              e = e.replace('\x01', 'T(False)').replace('\x02', 'T(None)').replace('\x03', 'T(True)')
+              e = e.replace('&&', '&').replace('||', '|')
+              e = re.sub(r'!(?!=)', '~', e)
+              try:
+                  r = eval(e, {'T': Tri, '__builtins__': {}}).v
+              except Exception:
+                  return None
+              return r
+
+          DIR = re.compile(r'^\s*#\s*(if|ifdef|ifndef|elif|else|endif)\b(.*)$')
+
+          def process(text):
+              out, stack, changed = [], [], False
+              def emitting():
+                  return all(f['mode'] == 'unknown' or (f['mode'] == 'known' and f['active']) for f in stack)
+              lines = text.split('\n')
+              i = 0
+              while i < len(lines):
+                  line = lines[i]
+                  full = line
+                  while full.rstrip().endswith('\\') and i + 1 < len(lines):
+                      i += 1; full = full.rstrip()[:-1] + ' ' + lines[i]
+                  m = DIR.match(full)
+                  if not m:
+                      if emitting(): out.append(line if full is line else full)
+                      i += 1; continue
+                  d, rest = m.group(1), m.group(2)
+                  if d in ('if', 'ifdef', 'ifndef'):
+                      if not emitting():
+                          stack.append({'mode': 'dead'}); i += 1; continue
+                      v = evaluate(d, rest)
+                      if v is None:
+                          stack.append({'mode': 'unknown'}); out.append(full)
+                      else:
+                          stack.append({'mode': 'known', 'active': v, 'taken': v}); changed = True
+                  elif d == 'elif':
+                      f = stack[-1]
+                      if f['mode'] == 'unknown': out.append(full)
+                      elif f['mode'] == 'known':
+                          if f['taken']: f['active'] = False
+                          else:
+                              v = evaluate('if', rest)
+                              if v is None:
+                                  f['mode'] = 'unknown'; out.append('#if' + rest)
+                              else:
+                                  f['active'] = v; f['taken'] = v
+                  elif d == 'else':
+                      f = stack[-1]
+                      if f['mode'] == 'unknown': out.append(full)
+                      elif f['mode'] == 'known':
+                          f['active'] = not f['taken']; f['taken'] = True
+                  else:  # endif
+                      f = stack.pop()
+                      if f['mode'] == 'unknown': out.append(full)
+                  i += 1
+              if stack: raise SystemExit('direktif tidak seimbang')
+              return '\n'.join(out), changed
+
+          def main():
+              r = subprocess.run(['git', 'grep', '-lE', r'CONFIG_KSU|ksu_', '--', '*.c', '*.h'], capture_output=True, text=True)
+              files = r.stdout.split()
+              done = []
+              for f in files:
+                  t = open(f, encoding='utf-8', errors='surrogateescape').read()
+                  n, ch = process(t)
+                  if ch and n != t:
+                      open(f, 'w', encoding='utf-8', errors='surrogateescape').write(n); done.append(f)
+              print('berkas dibersihkan:', ' '.join(done) if done else '(tidak ada)')
+              # pemeriksaan akhir
+              bad = []
+              r = subprocess.run(['git', 'grep', '-nE', r'ksu_|CONFIG_KSU', '--', '*.c', '*.h'], capture_output=True, text=True)
+              for l in r.stdout.splitlines():
+                  body = l.split(':', 2)[2].strip() if l.count(':') >= 2 else l
+                  if body.startswith(('//', '/*', '*')): continue
+                  if 'susfs' in body.lower() or 'CONFIG_KSU_SUSFS' in body: continue
+                  bad.append(l)
+              if bad:
+                  print('::error::Masih ada hook/guard KernelSU lama di tree setelah pembersihan:')
+                  print('\n'.join(bad[:60])); sys.exit(1)
+              print('Tree bersih dari hook KernelSU lama')
+
+          if __name__ == '__main__':
+              main()
+          PYSTRIP
+          python3 /tmp/strip_ksu.py
+          echo "== Ringkasan perubahan =="
+          git diff --stat | tail -15 || true
+          git config user.name ci; git config user.email ci@local
+          git add -A; git diff --cached --quiet || git commit -q -m "Remove legacy in-tree KernelSU hooks"
 
       - name: Set nama versi kernel (4.19.352-vorqen)
         working-directory: kernel_source
@@ -1036,7 +1181,7 @@ jobs:
           PY
           grep -n -A6 'config KALLSYMS_ALL' init/Kconfig
 
-      - name: Setup NoMount (v2.3.0-720)
+      - name: Setup NoMount (v2.3.1)
         working-directory: kernel_source
         run: |
           set -eo pipefail
