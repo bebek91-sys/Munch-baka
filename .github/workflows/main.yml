@@ -561,41 +561,25 @@ jobs:
           VFILES="$(grep -rlE "$VPAT" KernelSU/kernel --include=Kbuild --include=Makefile --include='*.mk' 2>/dev/null || true)"
           echo "== Definisi KSU_VERSION di BakaSU (SEBELUM) =="
           for f in $VFILES; do echo "--- $f"; grep -nE "$VPAT" "$f"; done
-          DRV_FINAL="tidak diubah"
+          # PENTING: tidak satu byte pun di KernelSU/ diubah dan tidak ada commit lokal. Sebelumnya Kbuild di-sed lalu di-commit
+          # ("ci: sync KSU_VERSION ..."); itu menghilangkan "-dirty" tetapi hash commit lokal itu (mis. c9a1065e) menjadi
+          # nama versi driver ("v4.2.0-rc3-c9a1065e"), bukan hash upstream. Sekarang repo KernelSU/ tetap persis commit upstream,
+          # sehingga nama versi driver = "${KSU_LABEL}" (TAG-HASH upstream) dan git tidak pernah dirty.
+          # Angka versi dipaksa lewat variabel baris-perintah make (KSU_VERSION=${CODE}); variabel baris-perintah mengalahkan
+          # "KSU_VERSION := ..." di Kbuild dan ikut ke sub-make lewat MAKEFLAGS. Langkah "Verifikasi versi" memastikan hasilnya.
+          DRV_FINAL="otomatis (dari git)"
           if [ "$KSU_SYNC_VERSION" = "true" ]; then
-            [ -n "$VFILES" ] || echo "::warning::definisi KSU_VERSION tidak ditemukan di Kbuild/Makefile BakaSU; versi driver tidak bisa disamakan (cek log 'Verifikasi versi' setelah build)"
-            for f in $VFILES; do
-              if grep -qE 'KSU_VERSION[[:space:]]*[:?]?=.*\\$' "$f"; then
-                echo "::warning::$f: definisi KSU_VERSION berlanjut ke baris berikutnya (\\), dilewati supaya tidak merusak file"; continue
-              fi
-              b="$(sha256sum "$f" | cut -c1-16)"
-              sed -i -E "s/DKSU_VERSION=[0-9]+/DKSU_VERSION=${CODE}/g; s/^([[:space:]]*(override[[:space:]]+)?KSU_VERSION[[:space:]]*[:?]?=).*\$/\1 ${CODE}/" "$f"
-              a="$(sha256sum "$f" | cut -c1-16)"
-              [ "$a" != "$b" ] && DRV_FINAL="$CODE"
-            done
-            echo "== Definisi KSU_VERSION di BakaSU (SESUDAH) =="
-            for f in $VFILES; do echo "--- $f"; grep -nE "$VPAT" "$f"; done
-            if [ "$DRV_FINAL" = "$CODE" ]; then
-              echo "::notice::Versi driver disamakan dengan manager: ${CODE}"
-            else
-              echo "::warning::tidak ada baris KSU_VERSION yang berubah; versi driver mungkin tetap dihitung otomatis dari git"
-            fi
+            DRV_FINAL="$CODE"
+            echo "KSU_MAKE_OVERRIDE=KSU_VERSION=${CODE}" >> "$GITHUB_ENV"
+            echo "::notice::Versi driver dipaksa ${CODE} lewat make KSU_VERSION=${CODE} (tanpa mengubah/commit apa pun di KernelSU/)"
           fi
-
-          # BakaSU menghitung versi drivernya sendiri lewat `git describe --dirty` DI DALAM repo KernelSU/ (clone
-          # terpisah dari tree kernel luar). sed di atas (dan setiap edit lain ke dalam folder ini) meninggalkan
-          # working tree KernelSU/ belum ter-commit, sehingga manager menampilkan akhiran "-dirty" pada
-          # "Kernel driver version" walau build dan fungsinya normal. Commit di sini (lokal, hanya di repo
-          # KernelSU/, tidak memengaruhi upstream) supaya git describe tidak lagi melihat perubahan.
-          git -C KernelSU config user.name "ci"
-          git -C KernelSU config user.email "ci@local"
-          if ! git -C KernelSU diff-index --quiet HEAD --; then
-            git -C KernelSU add -A
-            git -C KernelSU commit -q -m "ci: sync KSU_VERSION with manager versionCode ${CODE}"
-            echo "::notice::KernelSU/ di-commit lokal supaya 'git describe --dirty' bersih (versi driver tidak lagi berakhiran -dirty)"
-          else
-            echo "KernelSU/ sudah bersih, tidak ada yang perlu di-commit"
+          [ "$(git -C KernelSU rev-parse HEAD)" = "$BASE" ] \
+            || { echo "::error::HEAD KernelSU/ bukan commit upstream ${BASE:0:8}"; exit 1; }
+          DIRTY_TRACKED="$(git -C KernelSU status --porcelain --untracked-files=no)"
+          if [ -n "$DIRTY_TRACKED" ]; then
+            echo "$DIRTY_TRACKED"; echo "::error::Repo KernelSU/ tidak bersih; versi driver akan tampil -dirty"; exit 1
           fi
+          echo "OK      KernelSU/ = ${KSU_LABEL} (${BASE:0:8}), bersih, tanpa commit lokal"
           {
             echo "KSU_MGR_CODE=${CODE}"
             echo "KSU_DRV_VERSION=${DRV_FINAL}"
@@ -1687,7 +1671,7 @@ jobs:
 
           MAKE_ARGS="ARCH=arm64 SUBARCH=arm64 O=out CC=clang \
             CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- \
-            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu-"
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi- CLANG_TRIPLE=aarch64-linux-gnu- ${KSU_MAKE_OVERRIDE:-}"
 
           clang --version | head -1
           make $MAKE_ARGS ${DEVICE}_defconfig 2>&1 | tee ../build.log
@@ -2027,22 +2011,38 @@ jobs:
           echo "== Waktu build kernel (cocokkan dengan uname -v di HP untuk memastikan zip yang benar ter-flash) =="
           strings out/arch/arm64/boot/Image* 2>/dev/null | grep -m1 'Linux version'
 
-      - name: Verifikasi versi driver = versi manager (BakaSU)
+      - name: Verifikasi versi driver = versi manager (BakaSU), tanpa dirty
         working-directory: kernel_source
         run: |
           set +e
-          echo "== -DKSU_VERSION yang benar-benar dipakai compiler (dari berkas .cmd kbuild) =="
+          BAD=0
+          echo "== 1) Angka: -DKSU_VERSION yang benar-benar dipakai compiler (dari berkas .cmd kbuild) =="
           GOT="$(grep -rhoE 'DKSU_VERSION=[0-9]+' out/drivers/kernelsu 2>/dev/null | sort -u)"
           echo "${GOT:-(tidak ditemukan)}"
-          WANT="DKSU_VERSION=${KSU_MGR_CODE}"
           if [ -z "$GOT" ]; then
-            echo "::warning::-DKSU_VERSION tidak ditemukan di out/drivers/kernelsu; versi driver tidak bisa dipastikan = ${KSU_MGR_CODE}. Cek 'Setup BakaSU' (definisi KSU_VERSION sebelum/sesudah)."
-          elif [ "$GOT" = "$WANT" ]; then
-            echo "::notice::Versi driver ${KSU_MGR_CODE} = versionCode manager BakaSU"
+            echo "::error::-DKSU_VERSION tidak ditemukan di out/drivers/kernelsu; versi driver tidak bisa dipastikan = ${KSU_MGR_CODE}"; BAD=1
+          elif [ "$GOT" = "DKSU_VERSION=${KSU_MGR_CODE}" ]; then
+            echo "OK      angka versi driver ${KSU_MGR_CODE} = versionCode manager"
           else
-            echo "::warning::Versi driver di build ($(echo $GOT | tr '\n' ' ')) BEDA dari manager ${KSU_MGR_CODE}. Kirim log 'Setup BakaSU' supaya pola KSU_VERSION di Kbuild bisa disesuaikan."
+            echo "::error::Angka versi driver ($(echo $GOT | tr '\n' ' ')) BEDA dari manager ${KSU_MGR_CODE}"; BAD=1
           fi
-          exit 0
+          echo "== 2) Nama: 'BakaSU version name' dari build (harus = ${KSU_LABEL}, hash upstream) =="
+          NAME="$(grep -h 'BakaSU version name:' ../build.log 2>/dev/null | sed 's/.*version name: *//' | sort -u)"
+          echo "${NAME:-(tidak ditemukan)}"
+          if [ -z "$NAME" ]; then
+            echo "::warning::nama versi tidak tercetak di build.log; tidak bisa diverifikasi"
+          elif [ "$NAME" = "$KSU_LABEL" ]; then
+            echo "OK      nama versi driver = ${KSU_LABEL}"
+          else
+            echo "::error::Nama versi driver '${NAME}' BEDA dari ${KSU_LABEL} (hash bukan commit upstream / ada commit lokal)"; BAD=1
+          fi
+          echo "== 3) Repo KernelSU/ harus commit upstream dan tidak dirty =="
+          echo "HEAD   : $(git -C KernelSU rev-parse --short=8 HEAD) (upstream ${KSU_COMMIT:0:8})"
+          [ "$(git -C KernelSU rev-parse HEAD)" = "$KSU_COMMIT" ] || { echo "::error::HEAD KernelSU/ berubah dari commit upstream"; BAD=1; }
+          DT="$(git -C KernelSU status --porcelain --untracked-files=no)"
+          if [ -n "$DT" ]; then echo "$DT"; echo "::error::KernelSU/ dirty setelah build"; BAD=1; else echo "OK      KernelSU/ bersih (tidak -dirty)"; fi
+          [ "$BAD" = 0 ] || exit 1
+          echo "::notice::Driver BakaSU ${KSU_LABEL}, versi ${KSU_MGR_CODE} = manager, tidak dirty"
 
       - name: Ringkasan error (jika gagal)
         if: failure()
